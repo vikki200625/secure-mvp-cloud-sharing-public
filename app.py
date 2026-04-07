@@ -8,6 +8,10 @@ from datetime import datetime, timezone
 import io
 from flask import Flask, request, send_file, jsonify
 from cryptography.fernet import Fernet
+from .storage import get_backend
+
+# Storage backend (free-path by default)
+STORAGE = get_backend()
 
 
 APP = Flask(__name__)
@@ -87,6 +91,9 @@ def verify_token(token_str: str):
         sig = data.get("sig")
         if not payload or not sig:
             return None
+        # Check revocation first
+        if is_token_revoked(token_str):
+            return None
         payload_str = json.dumps(payload, separators=(",", ":"), sort_keys=True)
         expected_sig = hmac.new(
             TOKEN_SECRETS.encode(), payload_str.encode(), hashlib.sha256
@@ -110,10 +117,9 @@ def upload_item():
     data = f.read()
     item_id = str(uuid.uuid4())
     filename = f"{item_id}.enc"
-    # Encrypt and store
+    # Encrypt and store via storage backend
     enc = FERNET.encrypt(data)
-    with open(os.path.join(DATA_DIR, filename), "wb") as wf:
-        wf.write(enc)
+    STORAGE.put_object(filename, enc)
     item = {
         "id": item_id,
         "name": name,
@@ -152,12 +158,11 @@ def download_item():
     if not item:
         log_audit("unknown", item_id, "download", False, request.remote_addr)
         return jsonify({"error": "Item not found"}), 404
-    path = os.path.join(DATA_DIR, item["bucketKey"])
-    if not os.path.exists(path):
+    path = item["bucketKey"]
+    if not STORAGE.object_exists(path):
         log_audit(item["ownerId"], item_id, "download", False, request.remote_addr)
         return jsonify({"error": "Stored item not found"}), 500
-    with open(path, "rb") as rf:
-        enc = rf.read()
+    enc = STORAGE.get_object(path)
     data = FERNET.decrypt(enc)
     log_audit(item["ownerId"], item_id, "download", True, request.remote_addr)
     return send_file(
@@ -196,17 +201,39 @@ def share_item():
     )
 
 
+REV_FILE = os.path.join(DATA_DIR, "revoked_tokens.json")
+
+
+def ensure_revocation_store():
+    if not os.path.exists(REV_FILE):
+        with open(REV_FILE, "w") as f:
+            json.dump([], f)
+
+
+def load_revoked():
+    ensure_revocation_store()
+    with open(REV_FILE, "r") as f:
+        return set(json.load(f))
+
+
+def is_token_revoked(token_str: str) -> bool:
+    revoked = load_revoked()
+    return token_str in revoked
+
+
 @APP.route("/revoke", methods=["POST"])
 def revoke_token():
-    # Simple MVP: allow revocation by client providing token to blacklist in memory
+    # Simple MVP: revoke by adding the token string to a persisted blacklist
     if not verify_api_key():
         return jsonify({"error": "Unauthorized"}), 401
     data = request.get_json(force=True) or {}
     token = data.get("token")
     if not token:
         return jsonify({"error": "token required"}), 400
-    revoked = request.app.config.setdefault("REVOKED_TOKENS", set())
+    revoked = load_revoked()
     revoked.add(token)
+    with open(REV_FILE, "w") as f:
+        json.dump(list(revoked), f)
     log_audit("system", "unknown", "revoke", True, request.remote_addr)
     return jsonify({"revoked": True})
 
